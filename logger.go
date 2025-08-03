@@ -48,6 +48,8 @@ var (
 
 	moduleColor       = color.New(color.Faint)
 	importantKeyColor = color.New(color.FgHiYellow)
+	criticalKeyColor  = color.New(color.FgHiRed)
+	contextColor      = color.New(color.Faint)
 )
 
 // TextHandler is a [Handler] that writes Records to an [io.Writer] as a
@@ -71,6 +73,28 @@ func WithImportantKeys(keys ...string) Option {
 		for _, key := range keys {
 			h.importantKeys[key] = true
 		}
+	}
+}
+
+// WithCriticalKeys returns an Option that marks the specified keys as critical.
+// Critical keys will be highlighted in red when printed.
+func WithCriticalKeys(keys ...string) Option {
+	return func(h *TextHandler) {
+		if h.criticalKeys == nil {
+			h.criticalKeys = make(map[string]bool)
+		}
+		for _, key := range keys {
+			h.criticalKeys[key] = true
+		}
+	}
+}
+
+// WithContextKey returns an Option that sets keys whose values will be displayed
+// before the message without the key names, in a subdued color. Multiple keys
+// are displayed in the order specified, separated by spaces. Missing keys are skipped.
+func WithContextKey(keys ...string) Option {
+	return func(h *TextHandler) {
+		h.contextKeys = keys
 	}
 }
 
@@ -194,13 +218,16 @@ type commonHandler struct {
 	mu            *sync.Mutex
 	w             io.Writer
 	importantKeys map[string]bool
+	criticalKeys  map[string]bool
+	contextKeys   []string
+	contextValues map[string]string // cached context values from preformatted attrs
 
 	lastTime atomic.Int64
 }
 
 func (h *commonHandler) clone() *commonHandler {
 	// We can't use assignment because we can't copy the mutex.
-	return &commonHandler{
+	cloned := &commonHandler{
 		opts:              h.opts,
 		preformattedAttrs: slices.Clip(h.preformattedAttrs),
 		groupPrefix:       h.groupPrefix,
@@ -209,7 +236,17 @@ func (h *commonHandler) clone() *commonHandler {
 		w:                 h.w,
 		mu:                h.mu, // mutex shared among all clones of this handler
 		importantKeys:     h.importantKeys,
+		criticalKeys:      h.criticalKeys,
+		contextKeys:       slices.Clip(h.contextKeys),
 	}
+	// Deep copy the context values map
+	if h.contextValues != nil {
+		cloned.contextValues = make(map[string]string)
+		for k, v := range h.contextValues {
+			cloned.contextValues[k] = v
+		}
+	}
+	return cloned
 }
 
 // enabled reports whether l is greater than or equal to the
@@ -229,6 +266,39 @@ func (h *commonHandler) withAttrs(as []slog.Attr) *commonHandler {
 		return h
 	}
 	h2 := h.clone()
+
+	// Check if any context keys are being added
+	if len(h2.contextKeys) > 0 {
+		if h2.contextValues == nil {
+			h2.contextValues = make(map[string]string)
+		}
+		for _, a := range as {
+			for _, contextKey := range h2.contextKeys {
+				if a.Key == contextKey && h2.contextValues[contextKey] == "" {
+					h2.contextValues[contextKey] = fmt.Sprint(a.Value.Any())
+				}
+			}
+		}
+	}
+
+	// Filter out context keys from attributes if they exist
+	if len(h2.contextKeys) > 0 {
+		var filtered []slog.Attr
+		for _, a := range as {
+			isContextKey := false
+			for _, contextKey := range h2.contextKeys {
+				if a.Key == contextKey {
+					isContextKey = true
+					break
+				}
+			}
+			if !isContextKey {
+				filtered = append(filtered, a)
+			}
+		}
+		as = filtered
+	}
+
 	// Pre-format the attributes as an optimization.
 	state := h2.newHandleState((*Buffer)(&h2.preformattedAttrs), false, "")
 	defer state.free()
@@ -322,6 +392,43 @@ func (h *commonHandler) handle(r slog.Record, module string) error {
 		state.appendRawString(" ")
 	}
 
+	// Extract and display context values if contextKeys are set
+	if len(h.contextKeys) > 0 {
+		var contextParts []string
+
+		// Build a map of available values from record attrs
+		recordValues := make(map[string]string)
+		r.Attrs(func(a slog.Attr) bool {
+			for _, contextKey := range h.contextKeys {
+				if a.Key == contextKey {
+					recordValues[contextKey] = fmt.Sprint(a.Value.Any())
+				}
+			}
+			return true
+		})
+
+		// Collect values in the order specified by contextKeys
+		for _, contextKey := range h.contextKeys {
+			// Check cached values first
+			if h.contextValues != nil {
+				if val, ok := h.contextValues[contextKey]; ok && val != "" {
+					contextParts = append(contextParts, val)
+					continue
+				}
+			}
+			// Then check record values
+			if val, ok := recordValues[contextKey]; ok {
+				contextParts = append(contextParts, val)
+			}
+		}
+
+		// Display all found context values
+		if len(contextParts) > 0 {
+			state.appendRawString(contextColor.Sprint(strings.Join(contextParts, " ")))
+			state.appendRawString(" ")
+		}
+	}
+
 	if module != "" {
 		state.appendRawString(moduleColor.Sprint(module))
 		state.appendRawString(" ")
@@ -387,13 +494,12 @@ func (h *commonHandler) attrSep() string {
 // The initial value of sep determines whether to emit a separator
 // before the next key, after which it stays true.
 type handleState struct {
-	h                     *commonHandler
-	buf                   *Buffer
-	freeBuf               bool      // should buf be freed?
-	sep                   string    // separator to write before next key
-	prefix                *Buffer   // for text: key prefix
-	groups                *[]string // pool-allocated slice of active groups, for ReplaceAttr
-	currentKeyIsImportant bool      // track if current key is important
+	h       *commonHandler
+	buf     *Buffer
+	freeBuf bool      // should buf be freed?
+	sep     string    // separator to write before next key
+	prefix  *Buffer   // for text: key prefix
+	groups  *[]string // pool-allocated slice of active groups, for ReplaceAttr
 }
 
 var groupPool = sync.Pool{New: func() any {
@@ -518,6 +624,15 @@ func sourceGroup(s *slog.Source) slog.Value {
 // It handles replacement and checking for an empty key.
 // It reports whether something was appended.
 func (s *handleState) appendAttr(a slog.Attr) bool {
+	// Skip context keys if they're being displayed separately
+	if len(s.h.contextKeys) > 0 && (s.groups == nil || len(*s.groups) == 0) {
+		for _, contextKey := range s.h.contextKeys {
+			if a.Key == contextKey {
+				return false
+			}
+		}
+	}
+
 	a.Value = a.Value.Resolve()
 	if rep := s.h.opts.ReplaceAttr; rep != nil && a.Value.Kind() != slog.KindGroup {
 		var gs []string
@@ -601,16 +716,15 @@ func (s *handleState) appendError(err error) {
 var (
 	faintBoldColor = color.New(color.Faint, color.Bold)
 	boldColor      = color.New(color.Bold)
-	underlineColor = color.New(color.Underline)
 )
 
 func (s *handleState) appendKey(key string) {
 	s.buf.WriteString(s.sep)
 
-	// Check if this key is important and track it for value formatting
-	s.currentKeyIsImportant = s.h.importantKeys != nil && s.h.importantKeys[key]
-
-	if s.currentKeyIsImportant {
+	// Check key priority: critical > important > normal
+	if s.h.criticalKeys != nil && s.h.criticalKeys[key] {
+		key = criticalKeyColor.Colorize(key) + boldColor.Colorize(": ")
+	} else if s.h.importantKeys != nil && s.h.importantKeys[key] {
 		key = importantKeyColor.Colorize(key) + boldColor.Colorize(": ")
 	} else {
 		key = faintBoldColor.Colorize(key) + boldColor.Colorize(": ")
@@ -662,21 +776,8 @@ func (s *handleState) appendString(str string) {
 	}
 
 	if needsQuoting(str) {
-		// For quoted strings, apply underline after quoting to avoid escape sequences
-		if s.currentKeyIsImportant {
-			origLen := len(*s.buf)
-			*s.buf = strconv.AppendQuote(*s.buf, str)
-			quotedValue := string((*s.buf)[origLen:])
-			*s.buf = (*s.buf)[:origLen]
-			s.appendRawString(underlineColor.Sprint(quotedValue))
-		} else {
-			*s.buf = strconv.AppendQuote(*s.buf, str)
-		}
+		*s.buf = strconv.AppendQuote(*s.buf, str)
 	} else {
-		// For unquoted strings, apply underline directly
-		if s.currentKeyIsImportant {
-			str = underlineColor.Sprint(str)
-		}
 		s.buf.WriteString(str)
 	}
 }
@@ -769,17 +870,7 @@ func appendTextValue(s *handleState, v slog.Value) error {
 		}
 		s.appendString(fmt.Sprintf("%+v", v.Any()))
 	default:
-		if s.currentKeyIsImportant {
-			// For non-string values, we need to format first then apply underline
-			origLen := len(*s.buf)
-			*s.buf = appendValue(v, *s.buf)
-			// Get the appended value and apply underline
-			appendedValue := string((*s.buf)[origLen:])
-			*s.buf = (*s.buf)[:origLen]
-			s.appendRawString(underlineColor.Sprint(appendedValue))
-		} else {
-			*s.buf = appendValue(v, *s.buf)
-		}
+		*s.buf = appendValue(v, *s.buf)
 	}
 	return nil
 }
@@ -809,15 +900,7 @@ func (s *handleState) appendValue(v slog.Value) {
 }
 
 func (s *handleState) appendTime(t time.Time) {
-	if s.currentKeyIsImportant {
-		origLen := len(*s.buf)
-		*s.buf = appendRFC3339Millis(*s.buf, t)
-		timeValue := string((*s.buf)[origLen:])
-		*s.buf = (*s.buf)[:origLen]
-		s.appendRawString(underlineColor.Sprint(timeValue))
-	} else {
-		*s.buf = appendRFC3339Millis(*s.buf, t)
-	}
+	*s.buf = appendRFC3339Millis(*s.buf, t)
 }
 
 func appendRFC3339Millis(b []byte, t time.Time) []byte {
