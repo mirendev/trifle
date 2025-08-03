@@ -46,7 +46,8 @@ var (
 		slog.LevelError: color.New(color.FgHiRed),
 	}
 
-	moduleColor = color.New(color.Faint)
+	moduleColor       = color.New(color.Faint)
+	importantKeyColor = color.New(color.FgHiYellow)
 )
 
 // TextHandler is a [Handler] that writes Records to an [io.Writer] as a
@@ -57,14 +58,31 @@ type TextHandler struct {
 	module string
 }
 
+// Option is a function that configures a TextHandler.
+type Option func(*TextHandler)
+
+// WithImportantKeys returns an Option that marks the specified keys as important.
+// Important keys will be highlighted in yellow when printed.
+func WithImportantKeys(keys ...string) Option {
+	return func(h *TextHandler) {
+		if h.importantKeys == nil {
+			h.importantKeys = make(map[string]bool)
+		}
+		for _, key := range keys {
+			h.importantKeys[key] = true
+		}
+	}
+}
+
 // New creates a [TextHandler] that writes to w,
 // using the given options.
 // If opts is nil, the default options are used.
-func New(w io.Writer, opts *slog.HandlerOptions) *TextHandler {
+func New(w io.Writer, opts *slog.HandlerOptions, options ...Option) *TextHandler {
 	if opts == nil {
 		opts = &slog.HandlerOptions{}
 	}
-	return &TextHandler{
+
+	h := &TextHandler{
 		commonHandler: &commonHandler{
 			w:    w,
 			opts: *opts,
@@ -72,6 +90,13 @@ func New(w io.Writer, opts *slog.HandlerOptions) *TextHandler {
 		},
 		module: "",
 	}
+
+	// Apply options
+	for _, opt := range options {
+		opt(h)
+	}
+
+	return h
 }
 
 // Quick returns a [TextHandler] that writes to os.Stderr at the Debug level.
@@ -163,11 +188,12 @@ type commonHandler struct {
 	// It holds the prefix for groups that were already pre-formatted.
 	// A group will appear here when a call to WithGroup is followed by
 	// a call to WithAttrs.
-	groupPrefix string
-	groups      []string // all groups started from WithGroup
-	nOpenGroups int      // the number of groups opened in preformattedAttrs
-	mu          *sync.Mutex
-	w           io.Writer
+	groupPrefix   string
+	groups        []string // all groups started from WithGroup
+	nOpenGroups   int      // the number of groups opened in preformattedAttrs
+	mu            *sync.Mutex
+	w             io.Writer
+	importantKeys map[string]bool
 
 	lastTime atomic.Int64
 }
@@ -182,6 +208,7 @@ func (h *commonHandler) clone() *commonHandler {
 		nOpenGroups:       h.nOpenGroups,
 		w:                 h.w,
 		mu:                h.mu, // mutex shared among all clones of this handler
+		importantKeys:     h.importantKeys,
 	}
 }
 
@@ -360,12 +387,13 @@ func (h *commonHandler) attrSep() string {
 // The initial value of sep determines whether to emit a separator
 // before the next key, after which it stays true.
 type handleState struct {
-	h       *commonHandler
-	buf     *Buffer
-	freeBuf bool      // should buf be freed?
-	sep     string    // separator to write before next key
-	prefix  *Buffer   // for text: key prefix
-	groups  *[]string // pool-allocated slice of active groups, for ReplaceAttr
+	h                     *commonHandler
+	buf                   *Buffer
+	freeBuf               bool      // should buf be freed?
+	sep                   string    // separator to write before next key
+	prefix                *Buffer   // for text: key prefix
+	groups                *[]string // pool-allocated slice of active groups, for ReplaceAttr
+	currentKeyIsImportant bool      // track if current key is important
 }
 
 var groupPool = sync.Pool{New: func() any {
@@ -573,11 +601,20 @@ func (s *handleState) appendError(err error) {
 var (
 	faintBoldColor = color.New(color.Faint, color.Bold)
 	boldColor      = color.New(color.Bold)
+	underlineColor = color.New(color.Underline)
 )
 
 func (s *handleState) appendKey(key string) {
 	s.buf.WriteString(s.sep)
-	key = faintBoldColor.Colorize(key) + boldColor.Colorize(": ")
+
+	// Check if this key is important and track it for value formatting
+	s.currentKeyIsImportant = s.h.importantKeys != nil && s.h.importantKeys[key]
+
+	if s.currentKeyIsImportant {
+		key = importantKeyColor.Colorize(key) + boldColor.Colorize(": ")
+	} else {
+		key = faintBoldColor.Colorize(key) + boldColor.Colorize(": ")
+	}
 
 	if s.prefix != nil && len(*s.prefix) > 0 {
 		// TODO: optimize by avoiding allocation.
@@ -625,8 +662,21 @@ func (s *handleState) appendString(str string) {
 	}
 
 	if needsQuoting(str) {
-		*s.buf = strconv.AppendQuote(*s.buf, str)
+		// For quoted strings, apply underline after quoting to avoid escape sequences
+		if s.currentKeyIsImportant {
+			origLen := len(*s.buf)
+			*s.buf = strconv.AppendQuote(*s.buf, str)
+			quotedValue := string((*s.buf)[origLen:])
+			*s.buf = (*s.buf)[:origLen]
+			s.appendRawString(underlineColor.Sprint(quotedValue))
+		} else {
+			*s.buf = strconv.AppendQuote(*s.buf, str)
+		}
 	} else {
+		// For unquoted strings, apply underline directly
+		if s.currentKeyIsImportant {
+			str = underlineColor.Sprint(str)
+		}
 		s.buf.WriteString(str)
 	}
 }
@@ -719,7 +769,17 @@ func appendTextValue(s *handleState, v slog.Value) error {
 		}
 		s.appendString(fmt.Sprintf("%+v", v.Any()))
 	default:
-		*s.buf = appendValue(v, *s.buf)
+		if s.currentKeyIsImportant {
+			// For non-string values, we need to format first then apply underline
+			origLen := len(*s.buf)
+			*s.buf = appendValue(v, *s.buf)
+			// Get the appended value and apply underline
+			appendedValue := string((*s.buf)[origLen:])
+			*s.buf = (*s.buf)[:origLen]
+			s.appendRawString(underlineColor.Sprint(appendedValue))
+		} else {
+			*s.buf = appendValue(v, *s.buf)
+		}
 	}
 	return nil
 }
@@ -749,7 +809,15 @@ func (s *handleState) appendValue(v slog.Value) {
 }
 
 func (s *handleState) appendTime(t time.Time) {
-	*s.buf = appendRFC3339Millis(*s.buf, t)
+	if s.currentKeyIsImportant {
+		origLen := len(*s.buf)
+		*s.buf = appendRFC3339Millis(*s.buf, t)
+		timeValue := string((*s.buf)[origLen:])
+		*s.buf = (*s.buf)[:origLen]
+		s.appendRawString(underlineColor.Sprint(timeValue))
+	} else {
+		*s.buf = appendRFC3339Millis(*s.buf, t)
+	}
 }
 
 func appendRFC3339Millis(b []byte, t time.Time) []byte {
