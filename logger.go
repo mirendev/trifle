@@ -98,6 +98,14 @@ func WithContextKey(keys ...string) Option {
 	}
 }
 
+// WithTerminalWidth sets a specific terminal width for word wrapping
+// (mainly useful for testing)
+func WithTerminalWidth(width int) Option {
+	return func(h *TextHandler) {
+		h.terminalWidth = width
+	}
+}
+
 // New creates a [TextHandler] that writes to w,
 // using the given options.
 // If opts is nil, the default options are used.
@@ -106,11 +114,13 @@ func New(w io.Writer, opts *slog.HandlerOptions, options ...Option) *TextHandler
 		opts = &slog.HandlerOptions{}
 	}
 
+	termWidth := getTerminalWidth(w)
 	h := &TextHandler{
 		commonHandler: &commonHandler{
-			w:    w,
-			opts: *opts,
-			mu:   &sync.Mutex{},
+			w:             w,
+			opts:          *opts,
+			mu:            &sync.Mutex{},
+			terminalWidth: termWidth,
 		},
 		module: "",
 	}
@@ -221,6 +231,7 @@ type commonHandler struct {
 	criticalKeys  map[string]bool
 	contextKeys   []string
 	contextValues map[string]string // cached context values from preformatted attrs
+	terminalWidth int               // terminal width for word wrapping
 
 	lastTime atomic.Int64
 }
@@ -238,6 +249,7 @@ func (h *commonHandler) clone() *commonHandler {
 		importantKeys:     h.importantKeys,
 		criticalKeys:      h.criticalKeys,
 		contextKeys:       slices.Clip(h.contextKeys),
+		terminalWidth:     h.terminalWidth,
 	}
 	// Deep copy the context values map
 	if h.contextValues != nil {
@@ -494,12 +506,14 @@ func (h *commonHandler) attrSep() string {
 // The initial value of sep determines whether to emit a separator
 // before the next key, after which it stays true.
 type handleState struct {
-	h       *commonHandler
-	buf     *Buffer
-	freeBuf bool      // should buf be freed?
-	sep     string    // separator to write before next key
-	prefix  *Buffer   // for text: key prefix
-	groups  *[]string // pool-allocated slice of active groups, for ReplaceAttr
+	h           *commonHandler
+	buf         *Buffer
+	freeBuf     bool      // should buf be freed?
+	sep         string    // separator to write before next key
+	prefix      *Buffer   // for text: key prefix
+	groups      *[]string // pool-allocated slice of active groups, for ReplaceAttr
+	linePos     int       // current position on the line for word wrapping
+	needsIndent bool      // whether next output needs indentation
 }
 
 var groupPool = sync.Pool{New: func() any {
@@ -509,11 +523,13 @@ var groupPool = sync.Pool{New: func() any {
 
 func (h *commonHandler) newHandleState(buf *Buffer, freeBuf bool, sep string) handleState {
 	s := handleState{
-		h:       h,
-		buf:     buf,
-		freeBuf: freeBuf,
-		sep:     sep,
-		prefix:  NewBuffer(),
+		h:           h,
+		buf:         buf,
+		freeBuf:     freeBuf,
+		sep:         sep,
+		prefix:      NewBuffer(),
+		linePos:     0,
+		needsIndent: false,
 	}
 	if h.opts.ReplaceAttr != nil {
 		s.groups = groupPool.Get().(*[]string)
@@ -686,6 +702,29 @@ func (s *handleState) appendAttr(a slog.Attr) bool {
 			}
 		}
 
+		// For wrapping: check if key + value would fit on current line
+		if s.h.terminalWidth > 0 && s.linePos > 4 { // Only if not at start of indented line
+			// Estimate the total length of key + value
+			sepLen := 0
+			if s.sep != "" {
+				sepLen = calculateVisibleLength(s.sep)
+			}
+			keyLen := len(a.Key) + 2 // key + ": "
+
+			// Estimate value length
+			valueLen := estimateValueLength(a.Value)
+
+			// Check if the entire key-value pair would overflow
+			totalLen := sepLen + keyLen + valueLen
+			if s.linePos+totalLen > s.h.terminalWidth {
+				// Wrap to new line before key
+				s.buf.WriteNewLine()
+				s.buf.WriteString("    ")
+				s.linePos = 4
+				s.sep = "" // No separator needed at start of new line
+			}
+		}
+
 		s.appendKey(a.Key)
 		s.appendValue(a.Value)
 	}
@@ -701,12 +740,14 @@ const (
 
 func (s *handleState) appendShortTime(t time.Time) {
 	str := t.Format(TimeFormat)
-	s.appendString(str)
+	s.buf.WriteString(str)
+	s.linePos += len(str)
 }
 
 func (s *handleState) appendMiniTime(t time.Time) {
 	str := t.Format(MiniTimeFormat)
-	s.appendString(str)
+	s.buf.WriteString(str)
+	s.linePos += len(str)
 }
 
 func (s *handleState) appendError(err error) {
@@ -718,8 +759,61 @@ var (
 	boldColor      = color.New(color.Bold)
 )
 
+// calculateVisibleLength estimates the visible length of a string, ignoring ANSI codes
+func calculateVisibleLength(s string) int {
+	// Simple approximation: strip ANSI codes
+	inCode := false
+	length := 0
+	for _, r := range s {
+		if r == '\x1b' {
+			inCode = true
+		} else if inCode && r == 'm' {
+			inCode = false
+		} else if !inCode {
+			length++
+		}
+	}
+	return length
+}
+
+// estimateValueLength estimates the length a value will take when printed
+func estimateValueLength(v slog.Value) int {
+	switch v.Kind() {
+	case slog.KindString:
+		str := v.String()
+		if needsQuoting(str) {
+			return len(strconv.Quote(str))
+		}
+		return len(str)
+	case slog.KindInt64:
+		return len(strconv.FormatInt(v.Int64(), 10))
+	case slog.KindFloat64:
+		return len(strconv.FormatFloat(v.Float64(), 'g', -1, 64))
+	case slog.KindBool:
+		if v.Bool() {
+			return 4 // "true"
+		}
+		return 5 // "false"
+	case slog.KindDuration:
+		return len(v.Duration().String())
+	case slog.KindTime:
+		// RFC3339 format is fairly consistent in length
+		return 20
+	default:
+		// For other types, make a reasonable estimate
+		return 20
+	}
+}
+
 func (s *handleState) appendKey(key string) {
-	s.buf.WriteString(s.sep)
+	// Write separator if needed
+	if s.sep != "" {
+		s.buf.WriteString(s.sep)
+		s.linePos += calculateVisibleLength(s.sep)
+	}
+
+	// Track visible key length before adding colors
+	visibleKeyLen := len(key) + 2 // key + ": "
 
 	// Check key priority: critical > important > normal
 	if s.h.criticalKeys != nil && s.h.criticalKeys[key] {
@@ -731,10 +825,13 @@ func (s *handleState) appendKey(key string) {
 	}
 
 	if s.prefix != nil && len(*s.prefix) > 0 {
-		// TODO: optimize by avoiding allocation.
-		s.appendRawString(string(*s.prefix) + key)
+		prefixLen := len(*s.prefix)
+		s.buf.Write(*s.prefix)
+		s.buf.WriteString(key)
+		s.linePos += prefixLen + visibleKeyLen
 	} else {
-		s.appendRawString(key)
+		s.buf.WriteString(key)
+		s.linePos += visibleKeyLen
 	}
 	s.sep = s.h.attrSep()
 }
@@ -764,21 +861,47 @@ func needsQuoting(s string) bool {
 }
 
 func (s *handleState) appendRawString(str string) {
+	// Handle any needed indentation
+	if s.needsIndent && s.h.terminalWidth > 0 {
+		s.buf.WriteString("    ")
+		s.linePos = 4
+		s.needsIndent = false
+	}
+
 	s.buf.WriteString(str)
+	// Track line position using visible length
+	s.linePos += calculateVisibleLength(str)
 }
 
 func (s *handleState) appendString(str string) {
+	// Check if value would cause overflow before writing
+	valueLen := len(str)
+	if needsQuoting(str) {
+		valueLen = len(strconv.Quote(str))
+	}
+
+	// If terminal width is set and the value would overflow, wrap first
+	if s.h.terminalWidth > 0 && s.linePos > 0 && s.linePos+valueLen > s.h.terminalWidth {
+		s.buf.WriteNewLine()
+		s.buf.WriteString("    ")
+		s.linePos = 4
+	}
+
 	// text
 	if strings.Contains(str, "\n") {
 		s.appendRawString("\n")
 		writeIndent(s, str, "  │ ")
+		s.linePos = 0 // Reset after newline
 		return
 	}
 
 	if needsQuoting(str) {
-		*s.buf = strconv.AppendQuote(*s.buf, str)
+		quoted := strconv.Quote(str)
+		s.buf.WriteString(quoted)
+		s.linePos += len(quoted)
 	} else {
 		s.buf.WriteString(str)
+		s.linePos += len(str)
 	}
 }
 

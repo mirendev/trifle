@@ -62,7 +62,7 @@ func main() {
 
 	// Demonstrate module-based logging with multiple context keys
 	logger.Info("\n--- Module-based logging demo ---")
-	
+
 	// Create module loggers with context keys
 	authLogger := logger.With("module", "auth", "request_id", "req-123", "trace_id", "trace-001")
 	dbLogger := logger.With("module", "database", "request_id", "req-123", "trace_id", "trace-002")
