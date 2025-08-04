@@ -363,6 +363,8 @@ func (h *commonHandler) handle(r slog.Record, module string) error {
 	state.groups = nil // So ReplaceAttrs sees no groups instead of the pre groups.
 	rep := h.opts.ReplaceAttr
 
+	state.linePos = 0
+
 	// time
 	if !r.Time.IsZero() {
 		key := slog.TimeKey
@@ -372,13 +374,14 @@ func (h *commonHandler) handle(r slog.Record, module string) error {
 			lastTime := time.Unix(h.lastTime.Load(), 0)
 
 			if lastTime.IsZero() || val.Sub(lastTime) < 1*time.Hour || val.YearDay() != lastTime.YearDay() {
-				state.appendMiniTime(val)
+				state.linePos += state.appendMiniTime(val)
 			} else {
-				state.appendShortTime(val)
+				state.linePos += state.appendShortTime(val)
 			}
 			h.lastTime.Store(val.Unix())
 		} else {
 			state.appendAttr(slog.Time(key, val))
+			state.linePos += len(key) + 2 + 10 // key + ": ", 10 is a random guess for now.
 		}
 	}
 
@@ -392,6 +395,8 @@ func (h *commonHandler) handle(r slog.Record, module string) error {
 		str = spec
 	}
 
+	state.linePos += len(str)
+
 	if col, ok := _levelToColor[val]; ok {
 		str = col.Sprint(str)
 	}
@@ -402,7 +407,10 @@ func (h *commonHandler) handle(r slog.Record, module string) error {
 	if h.opts.AddSource {
 		state.appendAttr(slog.Any(slog.SourceKey, recordSource(r)))
 		state.appendRawString(" ")
+		state.linePos += len(slog.SourceKey) + 3 // key + ": " + " "
 	}
+
+	state.indentPos = 21
 
 	// Extract and display context values if contextKeys are set
 	if len(h.contextKeys) > 0 {
@@ -436,26 +444,33 @@ func (h *commonHandler) handle(r slog.Record, module string) error {
 
 		// Display all found context values
 		if len(contextParts) > 0 {
-			state.appendRawString(contextColor.Sprint(strings.Join(contextParts, " ")))
+			str := strings.Join(contextParts, " ")
+			state.appendRawString(contextColor.Sprint(str))
 			state.appendRawString(" ")
+			state.linePos += len(str) + 1 // +1 for the space after context values
 		}
 	}
 
 	if module != "" {
 		state.appendRawString(moduleColor.Sprint(module))
 		state.appendRawString(" ")
+		state.linePos += len(module) + 1 // +1 for the space after module
 	}
 
 	key = slog.MessageKey
 	msg := r.Message
 	if rep == nil {
 		state.appendRawString(msg)
+		state.linePos += len(msg)
 		if r.NumAttrs() > 0 || len(state.h.preformattedAttrs) > 0 {
 			state.appendRawString(" │ ")
+			state.linePos += 3 // " │ "
 		}
 	} else {
 		state.appendAttr(slog.String(key, msg))
+		state.linePos += len(key) + 2 + len(msg) // key + ": " + msg
 	}
+
 	state.groups = stateGroups // Restore groups passed to ReplaceAttrs.
 	state.appendNonBuiltIns(r)
 	state.buf.WriteNewLine()
@@ -514,6 +529,7 @@ type handleState struct {
 	groups      *[]string // pool-allocated slice of active groups, for ReplaceAttr
 	linePos     int       // current position on the line for word wrapping
 	needsIndent bool      // whether next output needs indentation
+	indentPos   int       // position to indent wrapped lines to (after time/level)
 }
 
 var groupPool = sync.Pool{New: func() any {
@@ -530,6 +546,7 @@ func (h *commonHandler) newHandleState(buf *Buffer, freeBuf bool, sep string) ha
 		prefix:      NewBuffer(),
 		linePos:     0,
 		needsIndent: false,
+		indentPos:   0,
 	}
 	if h.opts.ReplaceAttr != nil {
 		s.groups = groupPool.Get().(*[]string)
@@ -698,35 +715,47 @@ func (s *handleState) appendAttr(a slog.Attr) bool {
 				s.appendKey(a.Key)
 				s.appendRawString("\n")
 				writeIndent(s, str, "  │ ")
+				s.linePos = 0
 				return true
 			}
 		}
 
 		// For wrapping: check if key + value would fit on current line
-		if s.h.terminalWidth > 0 && s.linePos > 4 { // Only if not at start of indented line
-			// Estimate the total length of key + value
+		if s.h.terminalWidth > 0 {
+			// Calculate the actual formatted value string
+			valueStr := formatValueAsString(a.Value)
+
+			// Calculate the total length of key + value
 			sepLen := 0
 			if s.sep != "" {
 				sepLen = calculateVisibleLength(s.sep)
 			}
 			keyLen := len(a.Key) + 2 // key + ": "
-
-			// Estimate value length
-			valueLen := estimateValueLength(a.Value)
+			valueLen := len(valueStr)
 
 			// Check if the entire key-value pair would overflow
 			totalLen := sepLen + keyLen + valueLen
-			if s.linePos+totalLen > s.h.terminalWidth {
-				// Wrap to new line before key
+
+			// Wrap if adding this key-value pair would exceed terminal width
+			// Exception: don't wrap if we're at the start of a line and the pair fits
+			if s.linePos+totalLen > s.h.terminalWidth && s.linePos > s.indentPos {
+				// Wrap to new line and indent to match time/level position
 				s.buf.WriteNewLine()
-				s.buf.WriteString("    ")
-				s.linePos = 4
+				for i := 0; i < s.indentPos; i++ {
+					s.buf.WriteByte(' ')
+				}
+				s.linePos = s.indentPos
 				s.sep = "" // No separator needed at start of new line
 			}
+
+			s.appendKey(a.Key)
+			s.appendValue(a.Value)
+			s.linePos += totalLen
+		} else {
+			s.appendKey(a.Key)
+			s.appendValue(a.Value)
 		}
 
-		s.appendKey(a.Key)
-		s.appendValue(a.Value)
 	}
 	return true
 }
@@ -738,16 +767,16 @@ const (
 	MiniTimeFormat = "15:04:05.000"
 )
 
-func (s *handleState) appendShortTime(t time.Time) {
+func (s *handleState) appendShortTime(t time.Time) int {
 	str := t.Format(TimeFormat)
 	s.buf.WriteString(str)
-	s.linePos += len(str)
+	return len(str)
 }
 
-func (s *handleState) appendMiniTime(t time.Time) {
+func (s *handleState) appendMiniTime(t time.Time) int {
 	str := t.Format(MiniTimeFormat)
 	s.buf.WriteString(str)
-	s.linePos += len(str)
+	return len(str)
 }
 
 func (s *handleState) appendError(err error) {
@@ -776,32 +805,61 @@ func calculateVisibleLength(s string) int {
 	return length
 }
 
-// estimateValueLength estimates the length a value will take when printed
-func estimateValueLength(v slog.Value) int {
+// formatValueAsString returns the exact string representation of a value as it will be printed
+func formatValueAsString(v slog.Value) string {
 	switch v.Kind() {
 	case slog.KindString:
 		str := v.String()
 		if needsQuoting(str) {
-			return len(strconv.Quote(str))
+			return strconv.Quote(str)
 		}
-		return len(str)
+		return str
 	case slog.KindInt64:
-		return len(strconv.FormatInt(v.Int64(), 10))
+		return strconv.FormatInt(v.Int64(), 10)
+	case slog.KindUint64:
+		return strconv.FormatUint(v.Uint64(), 10)
 	case slog.KindFloat64:
-		return len(strconv.FormatFloat(v.Float64(), 'g', -1, 64))
+		return strconv.FormatFloat(v.Float64(), 'g', -1, 64)
 	case slog.KindBool:
-		if v.Bool() {
-			return 4 // "true"
-		}
-		return 5 // "false"
+		return strconv.FormatBool(v.Bool())
 	case slog.KindDuration:
-		return len(v.Duration().String())
+		return v.Duration().String()
 	case slog.KindTime:
-		// RFC3339 format is fairly consistent in length
-		return 20
+		return v.Time().Format(time.RFC3339Nano)
+	case slog.KindAny:
+		// Check for special types
+		if v.Any() == nil {
+			return "<nil>"
+		}
+		if tm, ok := v.Any().(encoding.TextMarshaler); ok {
+			if data, err := tm.MarshalText(); err == nil {
+				str := string(data)
+				if needsQuoting(str) {
+					return strconv.Quote(str)
+				}
+				return str
+			}
+		}
+		if bs, ok := byteSlice(v.Any()); ok {
+			return strconv.Quote(string(bs))
+		}
+		if err, ok := v.Any().(error); ok {
+			str := err.Error()
+			if needsQuoting(str) {
+				return strconv.Quote(str)
+			}
+			return str
+		}
+		// Default formatting
+		return fmt.Sprintf("%+v", v.Any())
+	case slog.KindGroup:
+		// Groups are handled separately
+		return ""
 	default:
-		// For other types, make a reasonable estimate
-		return 20
+		// Use the appendValue function to format
+		buf := make([]byte, 0, 32)
+		buf = appendValue(v, buf)
+		return string(buf)
 	}
 }
 
@@ -809,11 +867,7 @@ func (s *handleState) appendKey(key string) {
 	// Write separator if needed
 	if s.sep != "" {
 		s.buf.WriteString(s.sep)
-		s.linePos += calculateVisibleLength(s.sep)
 	}
-
-	// Track visible key length before adding colors
-	visibleKeyLen := len(key) + 2 // key + ": "
 
 	// Check key priority: critical > important > normal
 	if s.h.criticalKeys != nil && s.h.criticalKeys[key] {
@@ -825,13 +879,10 @@ func (s *handleState) appendKey(key string) {
 	}
 
 	if s.prefix != nil && len(*s.prefix) > 0 {
-		prefixLen := len(*s.prefix)
 		s.buf.Write(*s.prefix)
 		s.buf.WriteString(key)
-		s.linePos += prefixLen + visibleKeyLen
 	} else {
 		s.buf.WriteString(key)
-		s.linePos += visibleKeyLen
 	}
 	s.sep = s.h.attrSep()
 }
@@ -863,30 +914,16 @@ func needsQuoting(s string) bool {
 func (s *handleState) appendRawString(str string) {
 	// Handle any needed indentation
 	if s.needsIndent && s.h.terminalWidth > 0 {
-		s.buf.WriteString("    ")
-		s.linePos = 4
+		for i := 0; i < s.indentPos; i++ {
+			s.buf.WriteByte(' ')
+		}
 		s.needsIndent = false
 	}
 
 	s.buf.WriteString(str)
-	// Track line position using visible length
-	s.linePos += calculateVisibleLength(str)
 }
 
 func (s *handleState) appendString(str string) {
-	// Check if value would cause overflow before writing
-	valueLen := len(str)
-	if needsQuoting(str) {
-		valueLen = len(strconv.Quote(str))
-	}
-
-	// If terminal width is set and the value would overflow, wrap first
-	if s.h.terminalWidth > 0 && s.linePos > 0 && s.linePos+valueLen > s.h.terminalWidth {
-		s.buf.WriteNewLine()
-		s.buf.WriteString("    ")
-		s.linePos = 4
-	}
-
 	// text
 	if strings.Contains(str, "\n") {
 		s.appendRawString("\n")
@@ -898,10 +935,8 @@ func (s *handleState) appendString(str string) {
 	if needsQuoting(str) {
 		quoted := strconv.Quote(str)
 		s.buf.WriteString(quoted)
-		s.linePos += len(quoted)
 	} else {
 		s.buf.WriteString(str)
-		s.linePos += len(str)
 	}
 }
 
@@ -987,8 +1022,9 @@ func appendTextValue(s *handleState, v slog.Value) error {
 			return nil
 		}
 		if bs, ok := byteSlice(v.Any()); ok {
+			str := strconv.Quote(string(bs))
 			// As of Go 1.19, this only allocates for strings longer than 32 bytes.
-			s.buf.WriteString(strconv.Quote(string(bs)))
+			s.buf.WriteString(str)
 			return nil
 		}
 		s.appendString(fmt.Sprintf("%+v", v.Any()))
@@ -1022,6 +1058,8 @@ func (s *handleState) appendValue(v slog.Value) {
 	}
 }
 
+const prefixLen = len("2006-01-02T15:04:05.000")
+
 func (s *handleState) appendTime(t time.Time) {
 	*s.buf = appendRFC3339Millis(*s.buf, t)
 }
@@ -1031,7 +1069,6 @@ func appendRFC3339Millis(b []byte, t time.Time) []byte {
 	// but truncate it to use millisecond resolution.
 	// Unfortunately, that format trims trailing 0s, so add 1/10 millisecond
 	// to guarantee that there are exactly 4 digits after the period.
-	const prefixLen = len("2006-01-02T15:04:05.000")
 	n := len(b)
 	t = t.Truncate(time.Millisecond).Add(time.Millisecond / 10)
 	b = t.AppendFormat(b, time.RFC3339Nano)
